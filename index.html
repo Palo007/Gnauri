@@ -184,6 +184,26 @@
     border-top:1px solid var(--line);flex-wrap:wrap;
   }
   .modalFoot .grow{margin-right:auto;color:var(--dim);font-size:11px;align-self:center;max-width:55%}
+
+  /* ---- L/R balance popover ---- */
+  .balWrap{position:relative;display:inline-flex}
+  .balMenu{
+    position:absolute;z-index:40;left:0;bottom:calc(100% + 8px);
+    width:248px;background:var(--panel);border:1px solid var(--line);border-radius:12px;
+    box-shadow:0 14px 40px rgba(0,0,0,.5);padding:12px;display:none;
+  }
+  .balMenu.show{display:block}
+  .balHead{font-size:12px;font-weight:600;color:var(--accent);letter-spacing:.3px;text-transform:uppercase;margin-bottom:10px}
+  .balFld{display:flex;align-items:center;gap:9px;margin:8px 0}
+  .balFld .balTag{width:14px;text-align:center;color:var(--dim);font-weight:600}
+  .balFld input[type=range]{flex:1;accent-color:var(--accent)}
+  .balFld .balVal{width:42px;text-align:right;font-variant-numeric:tabular-nums;font-size:13px}
+  .balFoot{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:10px;border-top:1px solid var(--line);padding-top:10px}
+  .balFoot #balReset{padding:6px 12px;font-size:13px}
+  @media(max-width:560px){
+    /* on a phone, anchor the popover to the screen so it never clips off the button row */
+    .balMenu{position:fixed;left:10px;right:10px;bottom:auto;top:50%;transform:translateY(-50%);width:auto;max-width:340px;margin:0 auto}
+  }
   @media(max-width:560px){
     /* tighten everything so the loaded player fits one screen */
     .wrap{padding:10px;gap:8px}
@@ -253,7 +273,21 @@
     <div class="transport">
       <button id="playBtn" class="primary">▶ Play</button>
       <button id="stopBtn">⏹ Stop</button>
-      <button id="testBtn" title="Plays 200Hz in the left ear and 204Hz in the right for 4s — use headphones">🎧 Headphone check</button>
+      <div class="balWrap">
+        <button id="balBtn" title="Adjust left/right channel balance for your headphones — remembered on this device" aria-haspopup="true" aria-expanded="false">🎚 L/R Balance</button>
+        <div id="balMenu" class="balMenu" role="dialog" aria-label="Left/right channel balance">
+          <div class="balHead">L/R Channel Balance</div>
+          <div class="balFld">
+            <span class="balTag">L</span>
+            <input id="balSlider" type="range" min="-100" max="100" step="1" value="0" aria-label="Left/right balance">
+            <span class="balTag">R</span>
+          </div>
+          <div class="balFoot">
+            <span class="hint" id="balNote">Centered</span>
+            <button id="balReset">↺ Reset</button>
+          </div>
+        </div>
+      </div>
       <button id="exportBtn" title="Download the current (edited) schedule as a .gnaural file">💾 Export .gnaural</button>
       <div class="slider"><span class="hint nowrap">🔊</span><input id="masterVol" type="range" min="0" max="100" value="70"></div>
     </div>
@@ -356,11 +390,11 @@
   </div>
 </div>
 
-<footer>Gnauri <span id="ver">v25</span> · runs fully offline · use headphones for binaural beats · not a medical device</footer>
+<footer>Gnauri <span id="ver">v27</span> · runs fully offline · use headphones for binaural beats · not a medical device</footer>
 
 <script>
 /* Build version — stamped on every substantive edit (see CLAUDE.md). */
-const APP_VERSION = "v2026.06.25-1124";
+const APP_VERSION = "v2026.06.25-1306";
 
 /* ============================ Gnaural file parser ============================
    .gnaural files are XML. Schema (Gnaural 1.x / Java):
@@ -506,6 +540,9 @@ class GnauriEngine{
     this.onTick=null; this._uiVol=0.7; this.loopsLeft=0; this._played=0;
     // decoded WAV buffers for type-2 voices, keyed by normalized filename (see _lookupBuffer)
     this.audioBuffers={};
+    // global per-channel (L/R) output trim, 0..1.5 (1 = unchanged). A device-level balance for the
+    // user's ears/headphones, applied to the whole mix after the master gain. Defaults to centered.
+    this._chL=1; this._chR=1; this._trimL=null; this._trimR=null;
   }
   // normalize a filename for matching: lowercase, strip any path, trim whitespace
   _normName(s){ return String(s||"").trim().toLowerCase().replace(/^.*[\\/]/,""); }
@@ -533,8 +570,26 @@ class GnauriEngine{
       // channelCountMode="max" + channelInterpretation="speakers", which correctly
       // passes a 2-channel stereo input straight through to a stereo destination.
       // (Forcing "discrete"/"explicit" here was remapping/collapsing the merger output.)
-      this.master.connect(this.ctx.destination);
+      // ---- Global L/R balance trim ----
+      // Split the stereo master into its two channels, apply an independent gain to each, then
+      // re-merge to the destination. This lets the user trim Left vs Right for their ears/headphones
+      // without touching any per-voice volume. master -> splitter -> [gainL,gainR] -> merger -> dest.
+      const splitter=this.ctx.createChannelSplitter(2);
+      const merger=this.ctx.createChannelMerger(2);
+      this._trimL=this.ctx.createGain(); this._trimR=this.ctx.createGain();
+      this._trimL.gain.value=this._chL; this._trimR.gain.value=this._chR;
+      this.master.connect(splitter);
+      splitter.connect(this._trimL, 0); splitter.connect(this._trimR, 1);
+      this._trimL.connect(merger, 0, 0); this._trimR.connect(merger, 0, 1);
+      merger.connect(this.ctx.destination);
     }
+  }
+  // set the global L/R output trim (0..1.5). Applies live; remembered by the UI in localStorage.
+  setChannelGains(l, r){
+    this._chL=Math.max(0,Math.min(1.5, isFinite(l)?l:1));
+    this._chR=Math.max(0,Math.min(1.5, isFinite(r)?r:1));
+    if(this._trimL) this._trimL.gain.value=this._chL;
+    if(this._trimR) this._trimR.gain.value=this._chR;
   }
   // a schedule's `loops` is 0 => infinite, N>0 => play N times. loopsLeft mirrors this
   // with Infinity standing in for "infinite" so the countdown logic stays simple.
@@ -1234,22 +1289,64 @@ $("playBtn").onclick=()=>{
   if(engine.running){ engine.stop(); $("playBtn").textContent="▶ Play"; }
   else { const fresh=engine.currentTime()>=sched.totalTime; if(fresh) engine.loopsLeft=engine._loopsFromSched(); engine.play(fresh?0:engine.currentTime()); $("playBtn").textContent="⏸ Pause"; }
 };
-// L/R headphone check: 200 Hz in the left ear, 204 Hz in the right, for 4 seconds.
-// With headphones you should hear a steady tone in each ear; remove one side and the tone
-// stays steady (it does NOT collapse into a pulsing beat). On laptop/phone speakers both
-// tones reach both ears and you'll hear a 4 Hz beat — that's physics, not a bug.
-$("testBtn").onclick=()=>{
-  engine._ensureCtx(); const c=engine.ctx; if(c.state==="suspended") c.resume();
-  const t=c.currentTime, dur=4;
-  const oL=c.createOscillator(), oR=c.createOscillator(); oL.frequency.value=200; oR.frequency.value=204;
-  const gL=c.createGain(), gR=c.createGain(); gL.gain.value=gR.gain.value=0.4;
-  const pL=c.createStereoPanner(), pR=c.createStereoPanner(); pL.pan.value=-1; pR.pan.value=1;
-  oL.connect(gL).connect(pL).connect(c.destination);
-  oR.connect(gR).connect(pR).connect(c.destination);
-  oL.start(t); oR.start(t); oL.stop(t+dur); oR.stop(t+dur);
-  $("liveLbl").innerHTML="🎧 <b>Headphone check</b>: 200 Hz in your LEFT ear, 204 Hz in your RIGHT, for 4s. Each ear should hear a steady tone. <b>Use headphones</b> — on speakers both tones mix and you'll hear a beat (normal).";
-  setTimeout(()=>{ if(!engine.running) $("liveLbl").textContent="—"; }, dur*1000+500);
-};
+/* ---- L/R channel balance (global, persisted on this device) ----
+   A single center-detented balance control so the user can correct Left vs Right for their
+   headphones/ears. ONE value `bal` in -100..+100: 0 = centered (both channels at unity). Negative
+   leans left (attenuate RIGHT); positive leans right (attenuate LEFT). It never boosts above unity,
+   so there is no clipping risk. Independent of any schedule and of per-voice volume — applied in the
+   engine after the master gain. Persisted to localStorage so it survives reloads and app restarts. */
+const BAL_KEY="gnauri.balance.v2";
+function loadBalance(){
+  try{
+    const s=JSON.parse(localStorage.getItem(BAL_KEY)||"null");
+    if(s && isFinite(s.bal)) return Math.max(-100,Math.min(100,s.bal));
+    // migrate the old two-channel format (v1): derive a balance from the L/R difference.
+    // r-l: if L was louder (l>r) the result is negative => lean left; if R louder => positive.
+    const old=JSON.parse(localStorage.getItem("gnauri.balance.v1")||"null");
+    if(old && isFinite(old.l) && isFinite(old.r)){
+      return Math.max(-100,Math.min(100,Math.round(old.r-old.l)));
+    }
+  }catch(e){}
+  return 0;   // centered
+}
+function saveBalance(bal){ try{ localStorage.setItem(BAL_KEY, JSON.stringify({bal})); }catch(e){} }
+// derive per-channel gains from the single balance value (0..1, never above unity)
+function balToGains(bal){
+  const gL = bal>0 ? 1 - bal/100 : 1;   // lean right => quieter left
+  const gR = bal<0 ? 1 + bal/100 : 1;   // lean left  => quieter right
+  return {gL, gR};
+}
+function applyBalance(bal){
+  const {gL,gR}=balToGains(bal);
+  engine.setChannelGains(gL, gR);
+  $("balSlider").value=bal;
+  $("balNote").textContent = bal===0 ? "Centered"
+    : bal<0 ? ("Leaning left "+Math.abs(bal)+"%")
+            : ("Leaning right "+bal+"%");
+  $("balBtn").style.color = bal===0 ? "" : "var(--accent)";
+}
+function setBalance(bal,persist=true){
+  bal=Math.max(-100,Math.min(100,Math.round(bal)));
+  applyBalance(bal);
+  if(persist) saveBalance(bal);
+}
+// initialize from storage and apply immediately (engine applies it whenever the ctx exists)
+(function initBalance(){ setBalance(loadBalance(),false); })();
+$("balSlider").oninput=e=>setBalance(+e.target.value);
+$("balReset").onclick=()=>setBalance(0);
+// open/close the popover
+function toggleBalMenu(open){
+  const m=$("balMenu"); const show = open!=null ? open : !m.classList.contains("show");
+  m.classList.toggle("show",show);
+  $("balBtn").setAttribute("aria-expanded", show?"true":"false");
+}
+$("balBtn").onclick=e=>{ e.stopPropagation(); engine._ensureCtx(); toggleBalMenu(); };
+// click outside closes it
+document.addEventListener("click",e=>{
+  const m=$("balMenu"); if(!m.classList.contains("show")) return;
+  if(!m.contains(e.target) && e.target!==$("balBtn")) toggleBalMenu(false);
+});
+$("balMenu").onclick=e=>e.stopPropagation();
 $("stopBtn").onclick=()=>{ engine.stop(); $("playBtn").textContent="▶ Play"; graph.setPlay(0); $("seek").value=0; $("timeLbl").textContent="0:00 / "+fmt(sched?sched.totalTime:0); $("liveLbl").textContent="—"; };
 // "loop X/Y" suffix for the live label: infinite => X/∞, finite>1 => X/N, single => none
 function loopSuffix(){
