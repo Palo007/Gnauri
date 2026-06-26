@@ -394,7 +394,7 @@
 
 <script>
 /* Build version — stamped on every substantive edit (see CLAUDE.md). */
-const APP_VERSION = "v2026.06.26-0828";
+const APP_VERSION = "v2026.06.26-0833";
 
 /* ============================ Gnaural file parser ============================
    .gnaural files are XML. Schema (Gnaural 1.x / Java):
@@ -712,7 +712,6 @@ class GnauriEngine{
   play(offset=0, isLoopContinuation=false){
     this._ensureCtx();
     if(this.ctx.state==="suspended") this.ctx.resume();
-    this.ctx.onstatechange = () => console.log('AudioContext state:', this.ctx.state);
     if(this.running) this.stop();
     if(!isLoopContinuation && offset===0) this._played=0;
     const total = this.schedule.totalTime || 1;
@@ -828,6 +827,7 @@ class GnauriEngine{
         // explicit gain curve, because beatfreq can change across datapoints.
         const gapped = voice.type===4;
         const oscC=this.ctx.createOscillator(); oscC.type="sine";
+        oscC._vi = vi; oscC._side = 'C';
         this._scheduleParam(oscC.frequency, segs, offset, total, t0, s=>Math.max(1, s.base||200));
         // pulseGain applies the isochronic on/off envelope; gL/gR apply the L/R volume envelope.
         const pulse=this.ctx.createGain(); pulse.gain.value=0;
@@ -853,6 +853,8 @@ class GnauriEngine{
       // (forced above). For a mono voice we skip panning so both tones sum (true monaural beat).
       const oscL=this.ctx.createOscillator(), oscR=this.ctx.createOscillator();
       oscL.type=oscR.type="sine";
+      oscL._vi = vi; oscL._side = 'L';
+      oscR._vi = vi; oscR._side = 'R';
       const gL=this.ctx.createGain(), gR=this.ctx.createGain(); gL.gain.value=gR.gain.value=0;
       oscL.connect(gL); oscR.connect(gR);
       this._scheduleParam(oscL.frequency, segs, offset, total, t0, s=>s.base - s.beat/2);
@@ -872,7 +874,8 @@ class GnauriEngine{
       oscL.start(t0); oscR.start(t0);
       this.nodes.push(oscL,oscR,gL,gR);
     });
-
+    this._orientationHandler = () => this._orientationGuard();
+    window.addEventListener('orientationchange', this._orientationHandler);
     this.running=true;
     this._loop(total);
   }
@@ -946,6 +949,26 @@ class GnauriEngine{
     return Math.min(this.startOffset + (this.ctx.currentTime - this.startCtxTime),
                     this.schedule.totalTime);
   }
+  _orientationGuard(){
+    if(!this.running) return;
+    for(const n of this.nodes){
+      if(n._vi === undefined || !(n instanceof OscillatorNode)) continue;
+      const vi = n._vi;
+      const t = this.currentTime();
+      const segs = this.segCache[vi];
+      if(!segs || !segs.length) continue;
+      const s = sampleVoice(segs, t);
+      if(!s) continue;
+      const voice = this.schedule.voices[vi];
+      let freq;
+      if(voice.type === 0){
+        freq = n._side === 'L' ? s.base - s.beat/2 : s.base + s.beat/2;
+      } else {
+        freq = s.base;
+      }
+      n.frequency.setValueAtTime(Math.max(0, freq), this.ctx.currentTime);
+    }
+  }
   _loop(total){
     const step=()=>{
       if(!this.running) return;
@@ -965,7 +988,7 @@ class GnauriEngine{
     if(this.raf) cancelAnimationFrame(this.raf);
     for(const n of this.nodes){ try{ if(n.stop) n.stop(); n.disconnect(); }catch(e){} }
     this.nodes=[];
-    if(this.ctx) this.ctx.onstatechange = null;
+    if(this._orientationHandler){ window.removeEventListener('orientationchange', this._orientationHandler); this._orientationHandler=null; }
   }
 }
 
