@@ -394,7 +394,7 @@
 
 <script>
 /* Build version — stamped on every substantive edit (see CLAUDE.md). */
-const APP_VERSION = "v2026.06.26-0815";
+const APP_VERSION = "v2026.06.26-0828";
 
 /* ============================ Gnaural file parser ============================
    .gnaural files are XML. Schema (Gnaural 1.x / Java):
@@ -712,6 +712,7 @@ class GnauriEngine{
   play(offset=0, isLoopContinuation=false){
     this._ensureCtx();
     if(this.ctx.state==="suspended") this.ctx.resume();
+    this.ctx.onstatechange = () => console.log('AudioContext state:', this.ctx.state);
     if(this.running) this.stop();
     if(!isLoopContinuation && offset===0) this._played=0;
     const total = this.schedule.totalTime || 1;
@@ -964,6 +965,7 @@ class GnauriEngine{
     if(this.raf) cancelAnimationFrame(this.raf);
     for(const n of this.nodes){ try{ if(n.stop) n.stop(); n.disconnect(); }catch(e){} }
     this.nodes=[];
+    if(this.ctx) this.ctx.onstatechange = null;
   }
 }
 
