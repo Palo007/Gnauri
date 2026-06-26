@@ -394,7 +394,7 @@
 
 <script>
 /* Build version — stamped on every substantive edit (see CLAUDE.md). */
-const APP_VERSION = "v2026.06.25-1306";
+const APP_VERSION = "v2026.06.26-0815";
 
 /* ============================ Gnaural file parser ============================
    .gnaural files are XML. Schema (Gnaural 1.x / Java):
@@ -455,7 +455,8 @@ function parseGnaural(xmlString){
   const voices = voiceEls.map((v, vi) => {
     // type: 0 = binaural tone, 1 = pink noise, 2 = audio file,
     //       3 = isochronic pulse, 4 = alt isochronic (gapped). Gnaural also defines
-    //       5 = waterdrop, 6 = rain (nature sounds) which Gnauri does not synthesize yet.
+    //       5 = white noise, 6 = brown noise (Gnaural "nature sounds"). Gnauri synthesises
+//       these as stereo noise fields with decorrelated L/R channels.
     const rawType = num(childText(v,["type"]) ?? attr(v,["type"]), 0);
     const vdesc = childText(v,["description"]) || attr(v,["description","name"]) || ("Voice "+vi);
     const muted   = num(childText(v,["voice_mute"]) ?? attr(v,["mute"]), 0) === 1;
@@ -484,7 +485,9 @@ function parseGnaural(xmlString){
       return { duration, beat, base, volL:norm(vl), volR:norm(vr), state };
     }).filter(p => p.duration >= 0);
 
-    return { index:vi, type:rawType, desc:vdesc, muted, visible, mono, points };
+    // Read <voice_file> element — Gnaural uses this for type-2 sample filenames
+    const vfile = childText(v, ["voice_file"]) || null;
+    return { index:vi, type:rawType, desc:vdesc, file:vfile, muted, visible, mono, points };
   });
 
   // total time = max sum of any voice's durations (each voice should run full length)
@@ -531,6 +534,45 @@ function sampleVoice(segs, t){
   return {beat:last.beat,base:last.base,volL:last.volL,volR:last.volR};
 }
 
+/* White noise generator — LCRNG producing uniform ±1 samples.
+   Mirrors Gnaural-Web's WhiteNoiseGenerator exactly (same LCG constants,
+   same output mapping). For deterministic seeding, pass a seed; by default
+   uses Date.now(). */
+class WhiteNoiseGenerator {
+  constructor(seed = Date.now() & 0xffffffff) {
+    this.seed = (seed >>> 0) || 1;
+  }
+  next() {
+    this.seed = (1664525 * this.seed + 1013904223) >>> 0;
+    return (this.seed / 0xffffffff) * 2 - 1;
+  }
+}
+
+/* Brown noise generator — accumulated random walk with damping.
+   Mirrors Gnaural-Web's BrownNoiseGenerator exactly.
+   NOTE: No leakage compensation (/1.02) — the standard Brownian noise
+   formula divides the accumulated output by 1.02 per step to prevent DC
+   drift. Gnaural-Web omits this, so we do too for compatibility. The ±1
+   clamp prevents runaway but does not eliminate cumulative bias within
+   range. For very long sessions this may produce a slight DC offset. */
+class BrownNoiseGenerator {
+  constructor(seed = Date.now() & 0xffffffff) {
+    this.seed = (seed >>> 0) || 1;
+    this.last = 0;
+  }
+  _random() {
+    this.seed = (1664525 * this.seed + 1013904223) >>> 0;
+    return (this.seed / 0xffffffff) * 2 - 1;
+  }
+  next() {
+    const white = this._random();
+    this.last += white * 0.02;
+    if (this.last < -1) this.last = -1;
+    else if (this.last > 1) this.last = 1;
+    return this.last;
+  }
+}
+
 /* ============================ Audio engine ============================ */
 class GnauriEngine{
   constructor(){
@@ -540,6 +582,9 @@ class GnauriEngine{
     this.onTick=null; this._uiVol=0.7; this.loopsLeft=0; this._played=0;
     // decoded WAV buffers for type-2 voices, keyed by normalized filename (see _lookupBuffer)
     this.audioBuffers={};
+    // noise buffer caches for white/brown noise (type 5/6), keyed by length in seconds
+    this._whiteCache = {};
+    this._brownCache = {};
     // global per-channel (L/R) output trim, 0..1.5 (1 = unchanged). A device-level balance for the
     // user's ears/headphones, applied to the whole mix after the master gain. Defaults to centered.
     this._chL=1; this._chR=1; this._trimL=null; this._trimR=null;
@@ -548,7 +593,7 @@ class GnauriEngine{
   _normName(s){ return String(s||"").trim().toLowerCase().replace(/^.*[\\/]/,""); }
   // store a decoded buffer under its filename (called by the multi-file loader)
   setAudioBuffer(name, buffer){ this.audioBuffers[this._normName(name)]=buffer; }
-  clearAudioBuffers(){ this.audioBuffers={}; }
+  clearAudioBuffers(){ this.audioBuffers={}; this._whiteCache={}; this._brownCache={}; }
   // find the buffer a type-2 voice wants. The voice <description> holds the WAV filename,
   // e.g. "00Nature.wav". Match exact, then with a .wav extension appended as a fallback.
   _lookupBuffer(desc){
@@ -634,6 +679,36 @@ class GnauriEngine{
     return buf;
   }
 
+  /* Fill an AudioBuffer with white noise — independent random samples per
+     channel for decorrelated stereo (matching Gnaural-Web's approach).
+     Returns a 2-channel AudioBuffer. */
+  _generateWhiteBuffer(ctx, seconds){
+    const sr = ctx.sampleRate;
+    const len = Math.max(1, Math.floor(sr * seconds));
+    const buf = ctx.createBuffer(2, len, sr);
+    const gen = new WhiteNoiseGenerator();
+    for(let ch = 0; ch < 2; ch++){
+      const d = buf.getChannelData(ch);
+      for(let i = 0; i < len; i++) d[i] = gen.next();
+    }
+    return buf;
+  }
+
+  /* Fill an AudioBuffer with brown noise — independent random walk per
+     channel for decorrelated stereo (matching Gnaural-Web's approach).
+     Returns a 2-channel AudioBuffer. */
+  _generateBrownBuffer(ctx, seconds){
+    const sr = ctx.sampleRate;
+    const len = Math.max(1, Math.floor(sr * seconds));
+    const buf = ctx.createBuffer(2, len, sr);
+    const gen = new BrownNoiseGenerator();
+    for(let ch = 0; ch < 2; ch++){
+      const d = buf.getChannelData(ch);
+      for(let i = 0; i < len; i++) d[i] = gen.next();
+    }
+    return buf;
+  }
+
   play(offset=0, isLoopContinuation=false){
     this._ensureCtx();
     if(this.ctx.state==="suspended") this.ctx.resume();
@@ -660,7 +735,8 @@ class GnauriEngine{
         // (e.g. "00Nature.wav"). The user supplies the decoded buffer via the multi-file
         // loader; we look it up by filename in this.audioBuffers. If it's missing we simply
         // skip this voice (silent) rather than aborting the whole schedule.
-        const buf = this._lookupBuffer(voice.desc);
+        let buf = this._lookupBuffer(voice.desc);
+        if(!buf && voice.file) buf = this._lookupBuffer(voice.file);
         if(!buf) return;
         const src=this.ctx.createBufferSource();
         src.buffer=buf; src.loop=true;          // Gnaural loops the sample for the voice's span
@@ -680,32 +756,51 @@ class GnauriEngine{
         return;
       }
 
-      // Pink-noise path. Handles type 1 (pink noise) AND any UNIMPLEMENTED type (e.g. Gnaural
-      // waterdrop=5, rain=6, or any future id) as a fallback. Rationale: those unknown types are
-      // Gnaural "nature sounds" — noise beds shaped by per-ear amplitude, NOT tones. Their
-      // basefreq is a filter/character control, not an oscillator pitch, so rendering them as a
-      // tone produces silence (e.g. a Ganzfeld voice at basefreq=8 → an 8 Hz, inaudible "carrier").
-      // Routing them through noise + the schedule's independent L/R volume envelopes yields an
-      // audible, structurally faithful stereo noise field instead. It is NOT Gnaural's exact
-      // waterdrop/rain synthesis, but it is the closest correct approximation we can render.
-      const isNoise = voice.type===1;
-      const isUnknown = !(voice.type===0 || voice.type===1 || voice.type===2 || voice.type===3 || voice.type===4);
+      // Noise-voice path: type 1 = pink noise, type 5 = white noise, type 6 = brown noise.
+      // Also handles any truly unimplemented type as pink-noise fallback (backwards compat).
+      const isPink  = voice.type===1;
+      const isWhite = voice.type===5;
+      const isBrown = voice.type===6;
+      const isNoise = isPink || isWhite || isBrown;
+      const isUnknown = !(voice.type===0 || voice.type===1 || voice.type===2 || voice.type===3 || voice.type===4 || voice.type===5 || voice.type===6);
       if(isNoise || isUnknown){
         if(isUnknown){
-          console.warn(`Gnauri: voice ${vi} has unimplemented type=${voice.type}; rendering as a stereo noise field (Gnaural nature-sound fallback). Implemented: 0 binaural, 1 pink noise, 2 audio file, 3 isochronic, 4 alt isochronic.`);
+          console.warn(`Gnauri: voice ${vi} has unimplemented type=${voice.type}; rendering as a stereo noise field (Gnaural nature-sound fallback). Implemented: 0 binaural, 1 pink noise, 2 audio file, 3 isochronic, 4 alt isochronic, 5 white noise, 6 brown noise.`);
         }
-        const src=this.ctx.createBufferSource();
-        src.buffer=this._noiseBuffer(Math.min(total+1, 60)); src.loop=true;
-        // split to two channel chains so L and R can have different volume envelopes
+        let src, srcOut, filt;
         const merger=this.ctx.createChannelMerger(2);
-        const filt=this.ctx.createBiquadFilter(); filt.type="bandpass"; filt.Q.value=0.7;
-        // Only type-1 pink noise interprets basefreq as a bandpass center. For unknown nature-sound
-        // types basefreq is NOT a center frequency, so we leave the noise full-spectrum (no band).
-        const hasBand = isNoise && segs.some(s=>s.base>1);
-        if(hasBand){ src.connect(filt); }
-        const srcOut = hasBand ? filt : src;
-        this._scheduleParam(filt.frequency, segs, offset, total, t0, s=>Math.max(20,s.base||200));
-        const gL=this.ctx.createGain(), gR=this.ctx.createGain(); gL.gain.value=gR.gain.value=0;
+        if(isWhite){
+          // White noise — full-spectrum, no bandpass. Generate a longer buffer to avoid
+          // audible looping: min(total+1, 600) = up to 10 min for white noise vs pink's 60s,
+          // because white noise's flat spectrum makes repetition far more perceptible.
+          const t = Math.min(total+1, 600);
+          if(!this._whiteCache[t]) this._whiteCache[t] = this._generateWhiteBuffer(this.ctx, t);
+          src = this.ctx.createBufferSource();
+          src.buffer = this._whiteCache[t]; src.loop = true;
+          srcOut = src;
+        } else if(isBrown){
+          // Brown noise — full-spectrum, no bandpass. Same extended buffer logic.
+          const t = Math.min(total+1, 600);
+          if(!this._brownCache[t]) this._brownCache[t] = this._generateBrownBuffer(this.ctx, t);
+          src = this.ctx.createBufferSource();
+          src.buffer = this._brownCache[t]; src.loop = true;
+          srcOut = src;
+        } else {
+          // Pink noise (type 1) or unknown fallback — existing mono noise + optional bandpass
+          src = this.ctx.createBufferSource();
+          src.buffer = this._noiseBuffer(Math.min(total+1, 60)); src.loop = true;
+          filt = this.ctx.createBiquadFilter(); filt.type = "bandpass"; filt.Q.value = 0.7;
+          // Only pink noise interprets basefreq as a bandpass center. Unknown types,
+          // white/brown noise keep full spectrum (basefreq is a non-frequency control).
+          const hasBand = isPink && segs.some(s => s.base > 1);
+          if(hasBand) src.connect(filt);
+          srcOut = hasBand ? filt : src;
+          this._scheduleParam(filt.frequency, segs, offset, total, t0, s=>Math.max(20, s.base||200));
+          this.nodes.push(filt);
+        }
+        // split to two channel chains for independent L/R volume envelopes
+        const gL = this.ctx.createGain(), gR = this.ctx.createGain();
+        gL.gain.value = gR.gain.value = 0;
         for(const g of [gL,gR]){ g.channelCount=1; g.channelCountMode="explicit"; g.channelInterpretation="discrete"; }
         srcOut.connect(gL); srcOut.connect(gR);
         gL.connect(merger, 0, swap?1:0); gR.connect(merger, 0, swap?0:1);
@@ -713,7 +808,7 @@ class GnauriEngine{
         this._scheduleParam(gL.gain, segs, offset, total, t0, s=>s.volL);
         this._scheduleParam(gR.gain, segs, offset, total, t0, s=>s.volR);
         src.start(t0);
-        this.nodes.push(src,filt,gL,gR,merger);
+        this.nodes.push(src, gL, gR, merger);
         return;
       }
 
@@ -813,7 +908,10 @@ class GnauriEngine{
     let u = offset;                       // u = absolute schedule time we're generating at
     const end = offset + total;
     param.setValueAtTime(0, t0);
-    let guard = 0;                        // safety: never emit more than ~200k events
+    let guard = 0;                        // safety: never emit more than ~200k events.
+    // 200k is far beyond any practical schedule (e.g. 20 Hz beat × 10 000 s).
+    // A setValueCurveAtTime approach would reduce event count but adds complexity;
+    // not implemented because the guard is sufficient for all realistic use.
     while(u < end && guard++ < 200000){
       const rate = beatAt(u);
       if(rate <= 0.01){
@@ -1204,13 +1302,13 @@ class Graph{
 
 /* ============================ wiring ============================ */
 function fmt(s){ s=Math.max(0,Math.round(s)); const m=Math.floor(s/60); const ss=s%60; return m+":"+String(ss).padStart(2,"0"); }
-const typeName=t=>({0:"Tone (binaural)",1:"Pink noise",2:"Audio file",3:"Isochronic",4:"Alt isochronic"})[t]||("type "+t);
+const typeName=t=>({0:"Tone (binaural)",1:"Pink noise",2:"Audio file",3:"Isochronic",4:"Alt isochronic",5:"White noise",6:"Brown noise"})[t]||("type "+t);
 // "Tone-like" voices carry a meaningful carrier (base) and beat/pulse rate: binaural (0) and
 // the two isochronic types (3,4). Used by the graph/readout so isochronic voices plot like tones.
 const isTone=t=>(t===0||t===3||t===4);
 // Whether a voice's `base` value is a meaningful frequency worth plotting in the "base" view:
-// tone-like voices (carrier), or genuine type-1 pink noise with a bandpass set. For unknown
-// nature-sound types (5/6) base is a non-frequency character control, so we don't plot it.
+// tone-like voices (carrier), or genuine type-1 pink noise with a bandpass set. For
+// white/brown noise types (5/6) base is a non-frequency character control, so we don't plot it.
 const showsBase=(v,segs)=>isTone(v.type) || (v.type===1 && segs.some(x=>x.base>1));
 const VOICE_COLORS=["#5ad1c4","#ffb454","#a78bfa","#ff6b81","#5ad17a","#6cb6ff","#f78fb3","#e0d060"];
 const voiceColor=i=>VOICE_COLORS[i%VOICE_COLORS.length];
@@ -1674,7 +1772,7 @@ graph.onEditRequest=(vi,time)=>openEditDialog(vi,time);
    native 0..1 range. Offline, no deps: build the string, Blob it, click a temporary <a download>. */
 function xmlEscape(s){ return String(s==null?"":s)
   .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
-function gnauralTypeAttr(v){ return v.type; } // types map 1:1 to Gnaural ids (0,1,2,3,4,...)
+function gnauralTypeAttr(v){ return v.type; } // types map 1:1 to Gnaural ids (0,1,2,3,4,5,6,...)
 function buildGnauralXML(s){
   const total=Math.round(s.totalTime||0);
   let out="";
@@ -1691,6 +1789,7 @@ function buildGnauralXML(s){
   out+=` <voices>\n`;
   for(const v of s.voices){
     out+=`  <voice id="${v.index}" type="${gnauralTypeAttr(v)}" description="${xmlEscape(v.desc)}" voice_mute="${v.muted?1:0}" voice_hide="${v.visible?0:1}" voice_mono="${v.mono?1:0}">\n`;
+    if(v.file) out+=`   <voice_file>${xmlEscape(v.file)}</voice_file>\n`;
     out+=`   <datapoints>\n`;
     for(const p of v.points){
       const round=(x,d)=>{ const f=Math.pow(10,d); return Math.round((x||0)*f)/f; };

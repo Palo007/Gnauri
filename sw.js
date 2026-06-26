@@ -1,4 +1,4 @@
-const CACHE = "gnauri-v27";
+const CACHE = "gnauri-v28";
 const ASSETS = [
   "./", "./index.html", "./manifest.webmanifest", "./icon.svg", "./schedules.json",
   // Bundled schedules (from schedules.json) — precached so they play offline once installed.
