@@ -289,7 +289,7 @@
         </div>
       </div>
       <button id="exportBtn" title="Download the current (edited) schedule as a .gnaural file">💾 Export .gnaural</button>
-      <div class="slider"><span class="hint nowrap">🔊</span><input id="masterVol" type="range" min="0" max="100" value="70"></div>
+      <div class="slider"><span class="hint nowrap">🔊</span><input id="masterVol" type="range" min="0" max="150" value="100"></div>
     </div>
     <div class="row" style="margin-top:10px">
       <span class="time" id="timeLbl">0:00 / 0:00</span>
@@ -394,7 +394,7 @@
 
 <script>
 /* Build version — stamped on every substantive edit (see CLAUDE.md). */
-const APP_VERSION = "v2026.06.26-1447";
+const APP_VERSION = "v2026.06.28-1427";
 
 /* ============================ Gnaural file parser ============================
    .gnaural files are XML. Schema (Gnaural 1.x / Java):
@@ -579,7 +579,7 @@ class GnauriEngine{
     this.ctx=null; this.master=null; this.nodes=[]; this.running=false;
     this.startCtxTime=0; this.startOffset=0;
     this.schedule=null; this.segCache=[]; this.raf=null;
-    this.onTick=null; this._uiVol=0.7; this.loopsLeft=0; this._played=0;
+    this.onTick=null; this._uiVol=1; this.loopsLeft=0; this._played=0;
     // decoded WAV buffers for type-2 voices, keyed by normalized filename (see _lookupBuffer)
     this.audioBuffers={};
     // noise buffer caches for white/brown noise (type 5/6), keyed by length in seconds
@@ -588,6 +588,23 @@ class GnauriEngine{
     // global per-channel (L/R) output trim, 0..1.5 (1 = unchanged). A device-level balance for the
     // user's ears/headphones, applied to the whole mix after the master gain. Defaults to centered.
     this._chL=1; this._chR=1; this._trimL=null; this._trimR=null;
+    this._loopTimer=null;
+    this._elapsedAccrued=0;
+    this._spanStartCtxTime=0;
+    this._visHandler = () => {
+      if(document.visibilityState === 'visible' && this.running){
+        const t = this.currentTime();
+        const total = this.schedule ? this.schedule.totalTime : 1;
+        if(t >= total){
+          if(this.onTick) this.onTick(t);
+        }
+      }
+    };
+    document.addEventListener('visibilitychange', this._visHandler);
+  }
+  _elapsedSeconds(){
+    if(!this.running) return this._elapsedAccrued;
+    return this._elapsedAccrued + (this.ctx.currentTime - this._spanStartCtxTime);
   }
   // normalize a filename for matching: lowercase, strip any path, trim whitespace
   _normName(s){ return String(s||"").trim().toLowerCase().replace(/^.*[\\/]/,""); }
@@ -712,15 +729,19 @@ class GnauriEngine{
   play(offset=0, isLoopContinuation=false){
     this._ensureCtx();
     if(this.ctx.state==="suspended") this.ctx.resume();
-    if(this.running) this.stop();
-    if(!isLoopContinuation && offset===0) this._played=0;
+    if(this._loopTimer){ clearTimeout(this._loopTimer); this._loopTimer=null; }
+    if(this.running){
+      this._elapsedAccrued += this.ctx.currentTime - this._spanStartCtxTime;
+      this.stop();
+    }
+    if(!isLoopContinuation && offset===0){ this._elapsedAccrued=0; this._played=0; }
     const total = this.schedule.totalTime || 1;
     offset = Math.max(0, Math.min(offset, total));
     this.startOffset = offset;
     this.startCtxTime = this.ctx.currentTime;
+    this._spanStartCtxTime = this.ctx.currentTime;
     const t0 = this.startCtxTime;
     const swap = this.schedule.stereoswap;
-    const Lside = swap ? 1 : -1, Rside = swap ? -1 : 1;
     // overall (master) volume from the schedule, combined with the UI master gain
     const ov = (this.schedule.ovL + this.schedule.ovR)/2;
     if(this.master) this.master.gain.value = this._uiVol * ov;
@@ -880,6 +901,8 @@ class GnauriEngine{
     window.addEventListener('resize', this._resizeHandler);
     this.running=true;
     this._loop(total);
+    const timeUntilBoundary = total - offset;
+    this._loopTimer = setTimeout(() => this._onBoundary(), timeUntilBoundary * 1000);
   }
 
   // Schedule an AudioParam to follow the schedule's piecewise-linear timeline, driven by the
@@ -888,15 +911,19 @@ class GnauriEngine{
   // so single-entry voices stay perfectly constant (no glitch) and very short entries are never
   // skipped. `fn(seg)` reads the value (beat/base/vol) from a segment.
   _scheduleParam(param, segs, offset, total, t0, fn){
-    param.cancelScheduledValues(t0);
+    const now = this.ctx.currentTime;
+    const startAt = Math.max(t0, now);
+    param.cancelScheduledValues(startAt);
     // value at the exact playback start point (interpolated; offset may be mid-segment)
     const at = sampleVoice(segs, offset);   // {beat,base,volL,volR} interpolated at `offset`
-    param.setValueAtTime(Math.max(0, fn(at)), t0);
+    param.setValueAtTime(Math.max(0, fn(at)), startAt);
     for(let i=0;i<segs.length;i++){
       const s=segs[i], next=segs[i+1]||s;
       // each datapoint ramps from its own value toward the NEXT datapoint's value over its duration
-      if(s.t0 > offset) param.linearRampToValueAtTime(Math.max(0, fn(s)),    t0 + (s.t0 - offset));
-      if(s.t1 > offset) param.linearRampToValueAtTime(Math.max(0, fn(next)), t0 + (s.t1 - offset));
+      const ramp0 = t0 + (s.t0 - offset);
+      const ramp1 = t0 + (s.t1 - offset);
+      if(ramp0 > startAt) param.linearRampToValueAtTime(Math.max(0, fn(s)),    ramp0);
+      if(ramp1 > startAt) param.linearRampToValueAtTime(Math.max(0, fn(next)), ramp1);
     }
   }
 
@@ -976,22 +1003,32 @@ class GnauriEngine{
       if(!this.running) return;
       const t=this.currentTime();
       if(this.onTick) this.onTick(t);
-      if(t>=total){
-        // loopsLeft can be Infinity (infinite repeat). >1 means more plays remain.
-        if(this.loopsLeft>1){ if(this.loopsLeft!==Infinity) this.loopsLeft--; this._played++; this.play(0,true); return; }
-        this.stop(); if(this.onTick) this.onTick(total); return;
-      }
       this.raf=requestAnimationFrame(step);
     };
     this.raf=requestAnimationFrame(step);
   }
+  _onBoundary(){
+    if(!this.running) return;
+    if(this.loopsLeft>1){
+      if(this.loopsLeft!==Infinity) this.loopsLeft--;
+      this._played++;
+      this.play(0,true);
+      return;
+    }
+    this.stop(); if(this.onTick) this.onTick(this.schedule.totalTime);
+  }
   stop(){
+    if(this.running && this.ctx){
+      this._elapsedAccrued += this.ctx.currentTime - this._spanStartCtxTime;
+    }
+    if(this._loopTimer){ clearTimeout(this._loopTimer); this._loopTimer=null; }
     this.running=false;
     if(this.raf) cancelAnimationFrame(this.raf);
     for(const n of this.nodes){ try{ if(n.stop) n.stop(); n.disconnect(); }catch(e){} }
     this.nodes=[];
     if(this._orientationHandler){ window.removeEventListener('orientationchange', this._orientationHandler); this._orientationHandler=null; }
     if(this._resizeHandler){ window.removeEventListener('resize', this._resizeHandler); this._resizeHandler=null; }
+    document.removeEventListener('visibilitychange', this._visHandler);
   }
 }
 
@@ -1352,7 +1389,8 @@ function load(xml, name){
     // schedule doesn't keep sounding under the new one. The new schedule lands paused
     // at 0:00, waiting for an explicit Play press (audio needs a user gesture anyway).
     engine.stop();
-    $("playBtn").textContent="▶ Play";
+    engine._elapsedAccrued = 0;
+    updateTransportUI();
     sched=parseGnaural(xml);
     engine.setSchedule(sched); graph.setSchedule(sched);
     $("status").textContent="Loaded: "+(name||sched.title);
@@ -1367,7 +1405,7 @@ function load(xml, name){
     $("mVoices").textContent=sched.voices.length;
     $("mDesc").textContent=sched.desc;
     renderVoices(); setupVoiceHeaders();
-    $("timeLbl").textContent="0:00 / "+fmt(sched.totalTime);
+    $("timeLbl").textContent=fmtElapsed(0, sched.totalTime, sched.loops);
     $("seek").value=0; graph.setPlay(0);
     graph.setView($("viewSeg").querySelector(".on").dataset.view);
     syncLoopUI();
@@ -1412,8 +1450,8 @@ function setupVoiceHeaders(){
 // transport
 $("playBtn").onclick=()=>{
   if(!sched) return;
-  if(engine.running){ engine.stop(); $("playBtn").textContent="▶ Play"; }
-  else { const fresh=engine.currentTime()>=sched.totalTime; if(fresh) engine.loopsLeft=engine._loopsFromSched(); engine.play(fresh?0:engine.currentTime()); $("playBtn").textContent="⏸ Pause"; }
+  if(engine.running){ engine.stop(); updateTransportUI(); }
+  else { const fresh=engine.currentTime()>=sched.totalTime; if(fresh) engine.loopsLeft=engine._loopsFromSched(); engine.play(fresh?0:engine.currentTime()); updateTransportUI(); }
 };
 /* ---- L/R channel balance (global, persisted on this device) ----
    A single center-detented balance control so the user can correct Left vs Right for their
@@ -1473,7 +1511,10 @@ document.addEventListener("click",e=>{
   if(!m.contains(e.target) && e.target!==$("balBtn")) toggleBalMenu(false);
 });
 $("balMenu").onclick=e=>e.stopPropagation();
-$("stopBtn").onclick=()=>{ engine.stop(); $("playBtn").textContent="▶ Play"; graph.setPlay(0); $("seek").value=0; $("timeLbl").textContent="0:00 / "+fmt(sched?sched.totalTime:0); $("liveLbl").textContent="—"; };
+function updateTransportUI(){
+  $("playBtn").textContent = engine.running ? "⏸ Pause" : "▶ Play";
+}
+$("stopBtn").onclick=()=>{ engine.stop(); engine._elapsedAccrued=0; $("playBtn").textContent="▶ Play"; graph.setPlay(0); $("seek").value=0; $("timeLbl").textContent=fmtElapsed(0, sched?sched.totalTime:0, sched?sched.loops:0); $("liveLbl").textContent="—"; updateTransportUI(); };
 // "loop X/Y" suffix for the live label: infinite => X/∞, finite>1 => X/N, single => none
 function loopSuffix(){
   const n=sched.loops; // 0 = infinite
@@ -1484,7 +1525,8 @@ function loopSuffix(){
 }
 engine.onTick=t=>{
   graph.setPlay(t);
-  $("timeLbl").textContent=fmt(t)+" / "+fmt(sched.totalTime);
+  const elapsed = engine._elapsedSeconds();
+  $("timeLbl").textContent = fmtElapsed(elapsed, sched.totalTime, sched.loops);
   $("seek").value=Math.round(t/(sched.totalTime||1)*1000);
   const tv=sched.voices.find(v=>isTone(v.type)&&!v.muted);
   if(tv){ const s=sampleVoice(buildSegments(tv),t);
@@ -1493,13 +1535,13 @@ engine.onTick=t=>{
       else $("liveLbl").textContent=`${typeName(tv.type).toLowerCase()} · pulse ${s.beat.toFixed(2)} Hz · carrier ${s.base.toFixed(0)} Hz` + loopSuffix();
     }}
   else { const nv=sched.voices.find(v=>!v.muted); if(nv){ const s=sampleVoice(buildSegments(nv),t); if(s) $("liveLbl").textContent=`${nv.type===1?"noise":"voice"} · L ${(s.volL*100).toFixed(0)}% / R ${(s.volR*100).toFixed(0)}%`+loopSuffix(); } }
-  if(t>=sched.totalTime && engine.loopsLeft<=1){ $("playBtn").textContent="▶ Play"; }
+  if(t>=sched.totalTime && engine.loopsLeft<=1){ updateTransportUI(); }
 };
 $("seek").oninput=e=>{
   if(!sched) return;
   const t=(+e.target.value/1000)*sched.totalTime;
   graph.setPlay(t); $("timeLbl").textContent=fmt(t)+" / "+fmt(sched.totalTime);
-  if(engine.running){ engine.stop(); engine.play(t); $("playBtn").textContent="⏸ Pause"; }
+  if(engine.running){ engine.stop(); engine.play(t); updateTransportUI(); }
   else { engine.startOffset=t; }
 };
 $("masterVol").oninput=e=>engine.setMasterVolume(+e.target.value/100);
@@ -1512,6 +1554,11 @@ function fmtTotal(sec){
   const h=Math.floor(sec/3600), m=Math.floor((sec%3600)/60), s=sec%60;
   if(h>0) return h+"h"+(m?" "+m+"m":"");
   return m+":"+String(s).padStart(2,"0");
+}
+function fmtElapsed(sec, total, loops){
+  const elapsed = fmt(sec);
+  if(loops === 0 || !isFinite(loops)) return elapsed + " / ∞";
+  return elapsed + " / " + fmt(total * loops);
 }
 // The hint shows the ACTUAL play time (schedule duration × repeats), not the loop count.
 function loopHintHTML(n){
