@@ -394,7 +394,7 @@
 
 <script>
 /* Build version — stamped on every substantive edit (see CLAUDE.md). */
-const APP_VERSION = "v2026.06.28-1427";
+const APP_VERSION = "v2026.06.28-1429";
 
 /* ============================ Gnaural file parser ============================
    .gnaural files are XML. Schema (Gnaural 1.x / Java):
@@ -593,11 +593,7 @@ class GnauriEngine{
     this._spanStartCtxTime=0;
     this._visHandler = () => {
       if(document.visibilityState === 'visible' && this.running){
-        const t = this.currentTime();
-        const total = this.schedule ? this.schedule.totalTime : 1;
-        if(t >= total){
-          if(this.onTick) this.onTick(t);
-        }
+        if(this.onTick) this.onTick(this.currentTime());
       }
     };
     document.addEventListener('visibilitychange', this._visHandler);
@@ -731,7 +727,6 @@ class GnauriEngine{
     if(this.ctx.state==="suspended") this.ctx.resume();
     if(this._loopTimer){ clearTimeout(this._loopTimer); this._loopTimer=null; }
     if(this.running){
-      this._elapsedAccrued += this.ctx.currentTime - this._spanStartCtxTime;
       this.stop();
     }
     if(!isLoopContinuation && offset===0){ this._elapsedAccrued=0; this._played=0; }
@@ -1028,7 +1023,6 @@ class GnauriEngine{
     this.nodes=[];
     if(this._orientationHandler){ window.removeEventListener('orientationchange', this._orientationHandler); this._orientationHandler=null; }
     if(this._resizeHandler){ window.removeEventListener('resize', this._resizeHandler); this._resizeHandler=null; }
-    document.removeEventListener('visibilitychange', this._visHandler);
   }
 }
 
@@ -1514,7 +1508,7 @@ $("balMenu").onclick=e=>e.stopPropagation();
 function updateTransportUI(){
   $("playBtn").textContent = engine.running ? "⏸ Pause" : "▶ Play";
 }
-$("stopBtn").onclick=()=>{ engine.stop(); engine._elapsedAccrued=0; $("playBtn").textContent="▶ Play"; graph.setPlay(0); $("seek").value=0; $("timeLbl").textContent=fmtElapsed(0, sched?sched.totalTime:0, sched?sched.loops:0); $("liveLbl").textContent="—"; updateTransportUI(); };
+$("stopBtn").onclick=()=>{ engine.stop(); engine._elapsedAccrued=0; graph.setPlay(0); $("seek").value=0; $("timeLbl").textContent=fmtElapsed(0, sched?sched.totalTime:0, sched?sched.loops:0); $("liveLbl").textContent="—"; updateTransportUI(); };
 // "loop X/Y" suffix for the live label: infinite => X/∞, finite>1 => X/N, single => none
 function loopSuffix(){
   const n=sched.loops; // 0 = infinite
@@ -1537,10 +1531,13 @@ engine.onTick=t=>{
   else { const nv=sched.voices.find(v=>!v.muted); if(nv){ const s=sampleVoice(buildSegments(nv),t); if(s) $("liveLbl").textContent=`${nv.type===1?"noise":"voice"} · L ${(s.volL*100).toFixed(0)}% / R ${(s.volR*100).toFixed(0)}%`+loopSuffix(); } }
   if(t>=sched.totalTime && engine.loopsLeft<=1){ updateTransportUI(); }
 };
+// Seek-elapsed semantics: elapsed keeps accruing real wall-clock playback time
+// regardless of seek position. Seeking does not reset or freeze the counter.
+// This is by design — elapsed = "time spent listening" not "playhead position".
 $("seek").oninput=e=>{
   if(!sched) return;
   const t=(+e.target.value/1000)*sched.totalTime;
-  graph.setPlay(t); $("timeLbl").textContent=fmt(t)+" / "+fmt(sched.totalTime);
+  graph.setPlay(t); $("timeLbl").textContent=fmtElapsed(engine._elapsedSeconds(), sched.totalTime, sched.loops);
   if(engine.running){ engine.stop(); engine.play(t); updateTransportUI(); }
   else { engine.startOffset=t; }
 };
